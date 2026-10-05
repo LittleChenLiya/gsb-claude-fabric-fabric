@@ -13,6 +13,21 @@ Changelog
     names in this paragraph to visit their changelogs and see what you might get
     if you upgrade your dependencies.
 
+- :feature:`-` `~fabric.group.Group.run` (and the other group methods) now
+  return a `~fabric.group.GroupResult` carrying an ordered
+  `~fabric.group.GroupResult.entries` manifest of `~fabric.group.ResultEntry`
+  objects, one per input item, in input order. Each entry records whether the
+  item succeeded, failed at the command level, failed at the connection level,
+  or never started (e.g. after cancellation). The manifest is keyed by input
+  position, so multiple aliases pointing at the same address remain distinct
+  entries and the order never depends on thread completion order. A partial
+  result is never returned as if it were fully successful.
+
+  `~fabric.group.ThreadingGroup` also gains a `~fabric.group.ThreadingGroup.cancel`
+  method and a ``max_workers`` parameter: cancelling stops pulling new items
+  (which are then recorded as not started) while already-running items finish
+  normally. The manifest repr is safe to log and never leaks passwords, full
+  environments or connection parameters.
 - :release:`3.2.3 <2026-04-05>`
 - :support:`- backported` Tweak packaging metadata to reflect that Invoke 3.0
   has a backwards incompatible API change that we can't use yet.

@@ -1,10 +1,12 @@
-from unittest.mock import Mock, patch, call
+import socket
+import threading
+import time
+from unittest.mock import Mock
 from pytest import mark, raises
 
 from fabric import Connection, Group, SerialGroup, ThreadingGroup, GroupResult
-from fabric.group import thread_worker
+from fabric.group import _classify
 from fabric.exceptions import GroupException
-
 
 RUNNER_METHODS = ("run", "sudo")
 TRANSFER_METHODS = ("put", "get")
@@ -180,77 +182,40 @@ class SerialGroup_:
 
 
 class ThreadingGroup_:
-    def setup(self):
-        self.cxns = [Connection(x) for x in ("host1", "host2", "host3")]
-
     @mark.parametrize("method", ALL_METHODS)
-    @patch("fabric.group.Queue")
-    @patch("fabric.group.ExceptionHandlingThread")
-    def executes_arguments_on_contents_run_via_threading(
-        self, Thread, Queue, method
-    ):
-        queue = Queue.return_value
-        g = ThreadingGroup.from_connections(self.cxns)
-        # Make sure .exception() doesn't yield truthy Mocks. Otherwise we
-        # end up with 'exceptions' that cause errors due to all being the
-        # same.
-        Thread.return_value.exception.return_value = None
+    def executes_arguments_on_contents_run_via_threading(self, method):
+        # Use Mock connections so no real network I/O occurs.
+        cxns = [Mock(host=x) for x in ("host1", "host2", "host3")]
+        g = ThreadingGroup.from_connections(cxns)
         args = ARGS_BY_METHOD[method]
         kwargs = KWARGS_BY_METHOD[method]
-        getattr(g, method)(*args, **kwargs)
-        # Testing that threads were used the way we expect is mediocre but
-        # I honestly can't think of another good way to assert "threading
-        # was used & concurrency occurred"...
-        instantiations = [
-            call(
-                target=thread_worker,
-                kwargs=dict(
-                    cxn=cxn,
-                    queue=queue,
-                    method=method,
-                    args=args,
-                    kwargs=kwargs,
-                ),
-            )
-            for cxn in self.cxns
-        ]
-        Thread.assert_has_calls(instantiations, any_order=True)
-        # These ought to work as by default a Mock.return_value is a
-        # singleton mock object
-        expected = len(self.cxns)
-        for name, got in (
-            ("start", Thread.return_value.start.call_count),
-            ("join", Thread.return_value.join.call_count),
-        ):
-            err = "Expected {} calls to ExceptionHandlingThread.{}, got {}"  # noqa
-            err = err.format(expected, name, got)
-            assert expected, got == err
+        results = getattr(g, method)(*args, **kwargs)
+        expected = {x: getattr(x, method).return_value for x in cxns}
+        assert results == expected
+        # The ordered manifest has one entry per input item, in input order,
+        # regardless of thread completion timing.
+        assert [entry.connection for entry in results.entries] == cxns
+        assert results.statuses == ["success"] * len(cxns)
+        assert results.succeeded == expected
+        assert results.failed == {}
 
     @mark.parametrize("method", ALL_METHODS)
-    @patch("fabric.group.Queue")
-    def queue_used_to_return_results(self, Queue, method):
-        # Regular, explicit, mocks for Connections
+    def work_items_enqueued_in_input_order(self, method):
+        # Work items are enqueued as (index, cxn) in input order, and the
+        # manifest records results back in input order regardless of thread
+        # completion timing.
         cxns = [Mock(host=x) for x in ("host1", "host2", "host3")]
-        # Set up Queue with enough behavior to work / assert
-        queue = Queue.return_value
-        # Ending w/ a True will terminate a while-not-empty loop
-        queue.empty.side_effect = (False, False, False, True)
-        fakes = [(x, getattr(x, method).return_value) for x in cxns]
-        queue.get.side_effect = fakes[:]
-        # Execute & inspect results
         g = ThreadingGroup.from_connections(cxns)
         results = getattr(g, method)(
             *ARGS_BY_METHOD[method], **KWARGS_BY_METHOD[method]
         )
         expected = {x: getattr(x, method).return_value for x in cxns}
         assert results == expected
-        # Make sure queue was used as expected within worker &
-        # ThreadingGroup.run()
-        puts = [call(x) for x in fakes]
-        queue.put.assert_has_calls(puts, any_order=True)
-        assert queue.empty.called
-        gets = [call(block=False) for _ in cxns]
-        queue.get.assert_has_calls(gets)
+        # The ordered manifest has one entry per input item, in input order.
+        assert [entry.connection for entry in results.entries] == cxns
+        assert results.statuses == ["success", "success", "success"]
+        assert results.succeeded == expected
+        assert results.failed == {}
 
     @mark.parametrize("method", ALL_METHODS)
     def bubbles_up_errors_within_threads(self, method):
@@ -297,3 +262,274 @@ class ThreadingGroup_:
         assert result == expected
         assert result.succeeded == expected
         assert result.failed == {}
+
+
+class ResultManifest_:
+    """
+    Tests for the explicit, ordered result manifest.
+
+    Each input item keeps a per-input-identity status (success / command
+    failure / connection failure / not started), order is input order (not
+    completion order), and cancellation only blocks not-started items.
+    """
+
+    def _run_in_thread(self, g, method="run", *args, **kwargs):
+        """Run a group method in a thread; return result or wrapped result."""
+        holder = {"raised": False}
+
+        def target():
+            try:
+                holder["result"] = getattr(g, method)(*args, **kwargs)
+            except GroupException as e:
+                holder["raised"] = True
+                holder["result"] = e.result
+
+        t = threading.Thread(target=target)
+        t.start()
+        return t, holder
+
+    def manifest_preserves_input_order_despite_reverse_completion(self):
+        # Three fake connections complete in reverse order; the manifest must
+        # still be in input order.
+        cxns = [Mock(host=x) for x in ("host1", "host2", "host3")]
+        item_events = [threading.Event() for _ in cxns]
+        ready_events = [threading.Event() for _ in cxns]
+
+        def make_side_effect(i):
+            def side_effect(*a, **k):
+                ready_events[i].set()
+                item_events[i].wait(timeout=5)
+                return cxns[i].run.return_value
+
+            return side_effect
+
+        for i, cxn in enumerate(cxns):
+            cxn.run = Mock(side_effect=make_side_effect(i))
+
+        g = ThreadingGroup.from_connections(cxns)
+        t, holder = self._run_in_thread(g, "run", "whatever", hide=True)
+        for ready in ready_events:
+            assert ready.wait(timeout=5)
+        # Complete in reverse order: 2, 1, 0.
+        for i in reversed(range(len(cxns))):
+            item_events[i].set()
+            time.sleep(0.02)
+        t.join(timeout=5)
+
+        result = holder["result"]
+        assert [e.connection for e in result.entries] == cxns
+        assert result.statuses == ["success", "success", "success"]
+        assert result.succeeded == {x: x.run.return_value for x in cxns}
+        assert result.failed == {}
+
+    def manifest_records_command_and_connection_failures_in_place(self):
+        # One success, one command failure, one connection failure; completing
+        # in reverse must land each status in its original position.
+        from invoke.exceptions import UnexpectedExit
+
+        cxns = [Mock(host=x) for x in ("host1", "host2", "host3")]
+        item_events = [threading.Event() for _ in cxns]
+        ready_events = [threading.Event() for _ in cxns]
+
+        success_value = Mock(exited=0)
+        command_failure = UnexpectedExit(Mock(exited=1))
+        connection_failure = socket.gaierror("boom")
+
+        outcomes = [
+            ("success", success_value),
+            ("command_failed", command_failure),
+            ("connection_failed", connection_failure),
+        ]
+
+        def make_side_effect(i):
+            def side_effect(*a, **k):
+                ready_events[i].set()
+                item_events[i].wait(timeout=5)
+                status, payload = outcomes[i]
+                if status == "success":
+                    return payload
+                raise payload
+
+            return side_effect
+
+        for i, cxn in enumerate(cxns):
+            cxn.run = Mock(side_effect=make_side_effect(i))
+
+        g = ThreadingGroup.from_connections(cxns)
+        t, holder = self._run_in_thread(g, "run", "whatever", hide=True)
+        for ready in ready_events:
+            assert ready.wait(timeout=5)
+        for i in reversed(range(len(cxns))):
+            item_events[i].set()
+            time.sleep(0.02)
+        t.join(timeout=5)
+
+        result = holder["result"]
+        assert [e.connection for e in result.entries] == cxns
+        assert result.statuses == [
+            "success",
+            "command_failed",
+            "connection_failed",
+        ]
+        assert result.succeeded == {cxns[0]: success_value}
+        assert result.failed == {
+            cxns[1]: command_failure,
+            cxns[2]: connection_failure,
+        }
+        # A partial result must not be returned as full success.
+        assert not result.complete
+
+    def duplicate_aliases_are_separate_entries(self):
+        # Two aliases for the same address compare equal but are distinct input
+        # items, so the manifest must keep both.
+        cxn0 = Connection("samehost")
+        cxn1 = Connection("samehost")
+        assert cxn0 == cxn1  # same identity (host/user/port)
+        assert cxn0 is not cxn1
+        cxn0.run = Mock(return_value=Mock(exited=0))
+        cxn1.run = Mock(return_value=Mock(exited=0))
+
+        g = ThreadingGroup.from_connections([cxn0, cxn1])
+        result = g.run("whatever", hide=True)
+        entries = result.entries
+        assert len(entries) == 2
+        assert entries[0].connection is cxn0
+        assert entries[1].connection is cxn1
+        assert result.statuses == ["success", "success"]
+
+    def cancellation_marks_queued_items_not_started(self):
+        # With a single worker, item 0 runs while 1 and 2 stay queued. After
+        # cancel, the queued items are NOT_STARTED; item 0 keeps its real
+        # outcome.
+        cxns = [Mock(host=x) for x in ("host1", "host2", "host3")]
+        item0_started = threading.Event()
+        release_item0 = threading.Event()
+
+        def item0_side_effect(*a, **k):
+            item0_started.set()
+            release_item0.wait(timeout=5)
+            return cxns[0].run.return_value
+
+        cxns[0].run = Mock(side_effect=item0_side_effect)
+
+        g = ThreadingGroup.from_connections(cxns, max_workers=1)
+        t, holder = self._run_in_thread(g, "run", "whatever", hide=True)
+        assert item0_started.wait(timeout=5)
+        g.cancel()
+        release_item0.set()
+        t.join(timeout=5)
+
+        result = holder["result"]
+        statuses = result.statuses
+        assert statuses[0] == "success"
+        assert statuses[1] == "not_started"
+        assert statuses[2] == "not_started"
+        assert result.not_started
+        assert len(result.not_started) == 2
+        # The not-started items have no result/exception bodies.
+        for entry in result.not_started:
+            assert entry.result is None
+            assert entry.exception is None
+
+    def cancellation_does_not_block_running_items(self):
+        # Cancelling while an item is running must not prevent that item from
+        # completing normally.
+        cxns = [Mock(host=x) for x in ("host1", "host2")]
+        item0_started = threading.Event()
+        release_item0 = threading.Event()
+
+        def item0_side_effect(*a, **k):
+            item0_started.set()
+            release_item0.wait(timeout=5)
+            return cxns[0].run.return_value
+
+        cxns[0].run = Mock(side_effect=item0_side_effect)
+
+        g = ThreadingGroup.from_connections(cxns, max_workers=1)
+        t, holder = self._run_in_thread(g, "run", "whatever", hide=True)
+        assert item0_started.wait(timeout=5)
+        g.cancel()
+        # Item 0 is still running; give it a moment to finish after release.
+        release_item0.set()
+        t.join(timeout=5)
+
+        result = holder["result"]
+        assert result.statuses[0] == "success"
+        assert result.statuses[1] == "not_started"
+
+    def partial_result_with_not_started_raises_group_exception(self):
+        # A run that ends with not-started items is partial and must be raised
+        # as a GroupException, not returned as if fully successful.
+        cxns = [Mock(host=x) for x in ("host1", "host2")]
+        item0_started = threading.Event()
+        release_item0 = threading.Event()
+
+        def item0_side_effect(*a, **k):
+            item0_started.set()
+            release_item0.wait(timeout=5)
+            return cxns[0].run.return_value
+
+        cxns[0].run = Mock(side_effect=item0_side_effect)
+
+        g = ThreadingGroup.from_connections(cxns, max_workers=1)
+        t, holder = self._run_in_thread(g, "run", "whatever", hide=True)
+        assert item0_started.wait(timeout=5)
+        g.cancel()
+        release_item0.set()
+        t.join(timeout=5)
+
+        # The partial run must have been raised as a GroupException, not
+        # returned as if fully successful.
+        assert holder["raised"]
+        result = holder["result"]
+        assert not result.complete
+        assert result.statuses == ["success", "not_started"]
+
+    def repr_does_not_leak_secrets(self):
+        # The manifest repr must not expose passwords, full environments or
+        # connection parameters.
+        from invoke.runners import Result
+
+        cxn = Mock(host="host1")
+        secret_result = Result(
+            stdout="output",
+            env={"PASSWORD": "hunter2", "API_KEY": "secret"},
+            exited=0,
+        )
+        cxn.run = Mock(return_value=secret_result)
+
+        g = ThreadingGroup.from_connections([cxn])
+        result = g.run("whatever", hide=True)
+        text = repr(result)
+        assert "host1" in text
+        assert "success" in text
+        # Secrets must not appear in the manifest report.
+        assert "hunter2" not in text
+        assert "secret" not in text
+        assert "PASSWORD" not in text
+        assert "API_KEY" not in text
+        # The result body itself is not embedded.
+        assert repr(secret_result) not in text
+
+    def classify_distinguishes_command_and_connection_failures(self):
+        from invoke.exceptions import UnexpectedExit
+
+        assert _classify(UnexpectedExit(Mock(exited=1))) == "command_failed"
+        assert _classify(socket.gaierror("boom")) == "connection_failed"
+        assert _classify(RuntimeError("nope")) == "connection_failed"
+
+    def serial_group_also_populates_manifest_in_order(self):
+        cxns = [Mock(host=x) for x in ("host1", "host2", "host3")]
+        g = SerialGroup.from_connections(cxns)
+        result = g.run("whatever", hide=True)
+        assert [e.connection for e in result.entries] == cxns
+        assert result.statuses == ["success", "success", "success"]
+        assert result.complete
+
+    def empty_group_returns_complete_empty_manifest(self):
+        g = ThreadingGroup()
+        result = g.run("whatever", hide=True)
+        assert isinstance(result, GroupResult)
+        assert result.entries == []
+        assert result.complete
+        assert result.statuses == []
