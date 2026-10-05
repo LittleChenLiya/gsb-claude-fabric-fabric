@@ -1,7 +1,22 @@
+import socket
+import threading
+import time
 from unittest.mock import Mock, patch, call
 from pytest import mark, raises
 
-from fabric import Connection, Group, SerialGroup, ThreadingGroup, GroupResult
+from invoke.exceptions import UnexpectedExit
+from invoke.runners import Result
+
+from fabric import (
+    Config,
+    Connection,
+    Group,
+    SerialGroup,
+    ThreadingGroup,
+    GroupResult,
+    GroupManifest,
+    HostResult,
+)
 from fabric.group import thread_worker
 from fabric.exceptions import GroupException
 
@@ -297,3 +312,152 @@ class ThreadingGroup_:
         assert result == expected
         assert result.succeeded == expected
         assert result.failed == {}
+
+
+class RunManifest_:
+    def base_group_is_not_implemented(self):
+        with raises(NotImplementedError):
+            Group("host1").run_manifest("command")
+
+    def returns_manifest_not_exception_for_partial_failures(self):
+        cxns = [Mock(host=x) for x in ("host1", "host2")]
+        cxns[1].run.side_effect = UnexpectedExit(
+            Result(command="nope", exited=1)
+        )
+        g = SerialGroup.from_connections(cxns)
+        # Partial failure must not raise GroupException nor pretend to be
+        # a fully successful result; it returns an inspectable manifest.
+        manifest = g.run_manifest("command")
+        assert isinstance(manifest, GroupManifest)
+        assert not manifest.ok
+        assert len(manifest.succeeded) == 1
+        assert len(manifest.failed) == 1
+        assert len(manifest.not_started) == 0
+        assert manifest[0].status == HostResult.SUCCESS
+        assert manifest[0].result is cxns[0].run.return_value
+        assert manifest[1].status == HostResult.COMMAND_FAILED
+        assert isinstance(manifest[1].exception, UnexpectedExit)
+
+    def connection_errors_classified_as_connection_failed(self):
+        cxns = [Mock(host=x) for x in ("host1", "host2")]
+        cxns[0].run.side_effect = socket.gaierror("no such host")
+        g = SerialGroup.from_connections(cxns)
+        manifest = g.run_manifest("command")
+        assert manifest[0].status == HostResult.CONNECTION_FAILED
+        assert isinstance(manifest[0].exception, socket.gaierror)
+        assert manifest[1].status == HostResult.SUCCESS
+        assert not manifest.ok
+
+    def aliases_to_same_address_are_distinct_input_entries(self):
+        # Two connections resolving to the same address are still two
+        # distinct input items, keyed by position, not by connection.
+        cxns = [Mock(host="same"), Mock(host="same")]
+        g = SerialGroup.from_connections(cxns)
+        manifest = g.run_manifest("command")
+        assert len(manifest) == 2
+        assert manifest[0] is not manifest[1]
+        assert [e.index for e in manifest] == [0, 1]
+        assert [e.host for e in manifest] == ["same", "same"]
+        assert all(e.status == HostResult.SUCCESS for e in manifest)
+
+    def cancel_only_blocks_not_started_items(self):
+        event = threading.Event()
+        cxns = [Mock(host=x) for x in ("host1", "host2", "host3")]
+
+        def run_and_cancel(*args, **kwargs):
+            event.set()
+            return "finished"
+
+        cxns[0].run.side_effect = run_and_cancel
+        g = SerialGroup.from_connections(cxns)
+        manifest = g.run_manifest("command", cancel_event=event)
+        # Already-started item completed normally...
+        assert manifest[0].status == HostResult.SUCCESS
+        assert manifest[0].result == "finished"
+        # ...queued items were never started.
+        assert manifest[1].status == HostResult.NOT_STARTED
+        assert manifest[2].status == HostResult.NOT_STARTED
+        assert not cxns[1].run.called
+        assert not cxns[2].run.called
+        assert len(manifest.not_started) == 2
+        assert not manifest.ok
+
+    def threading_cancel_presets_queued_items_not_started(self):
+        event = threading.Event()
+        event.set()
+        cxns = [Mock(host=x) for x in ("host1", "host2", "host3")]
+        g = ThreadingGroup.from_connections(cxns)
+        manifest = g.run_manifest("command", cancel_event=event)
+        assert [e.status for e in manifest] == [HostResult.NOT_STARTED] * 3
+        for cxn in cxns:
+            assert not cxn.run.called
+        assert len(manifest.not_started) == 3
+        assert not manifest.ok
+
+    def threading_reverse_completion_order_lands_in_input_positions(self):
+        # Three fake connections whose workers finish in reverse order
+        # (host3 first, host1 last); manifest order must follow input
+        # order, not completion order.
+        cxns = [Mock(host="host%d" % i) for i in range(3)]
+        sentinel = Mock(name="slow-result")
+        command_failure = UnexpectedExit(Result(command="nope", exited=1))
+        connection_failure = socket.gaierror("no such host")
+
+        def slow_success(*args, **kwargs):
+            time.sleep(0.3)
+            return sentinel
+
+        def medium_command_failure(*args, **kwargs):
+            time.sleep(0.15)
+            raise command_failure
+
+        cxns[0].run.side_effect = slow_success
+        cxns[1].run.side_effect = medium_command_failure
+        cxns[2].run.side_effect = connection_failure
+        g = ThreadingGroup.from_connections(cxns)
+        manifest = g.run_manifest("command")
+        # Success and both failures landed back in their original slots.
+        assert [e.index for e in manifest] == [0, 1, 2]
+        assert [e.host for e in manifest] == ["host0", "host1", "host2"]
+        assert [e.status for e in manifest] == [
+            HostResult.SUCCESS,
+            HostResult.COMMAND_FAILED,
+            HostResult.CONNECTION_FAILED,
+        ]
+        assert manifest[0].result is sentinel
+        assert manifest[1].exception is command_failure
+        assert manifest[2].exception is connection_failure
+        assert not manifest.ok
+        assert len(manifest.succeeded) == 1
+        assert len(manifest.failed) == 2
+
+    def report_and_repr_omit_secrets_and_connection_params(self):
+        config = Config(
+            overrides={"run": {"env": {"SECRET_TOKEN": "topsecret"}}}
+        )
+        cxn = Connection(
+            "user@host1",
+            config=config,
+            connect_kwargs={"password": "s3cret-password"},
+        )
+        cxn.run = Mock(return_value=Result(command="x", exited=0))
+        g = SerialGroup.from_connections([cxn])
+        manifest = g.run_manifest("x")
+        blob = "\n".join(
+            [repr(manifest), manifest.report()]
+            + [repr(entry) for entry in manifest]
+        )
+        assert "s3cret-password" not in blob
+        assert "topsecret" not in blob
+        assert "SECRET_TOKEN" not in blob
+        assert "connect_kwargs" not in blob
+        # But it does show position, host identity and status.
+        assert "host1" in blob
+        assert "success" in blob
+
+    def normal_run_interface_unchanged(self):
+        cxns = [Mock(host=x) for x in ("host1", "host2")]
+        g = SerialGroup.from_connections(cxns)
+        result = g.run("command")
+        assert isinstance(result, GroupResult)
+        assert result == {x: x.run.return_value for x in cxns}

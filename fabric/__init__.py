@@ -2,7 +2,14 @@
 from ._version import __version_info__, __version__
 from .connection import Config, Connection
 from .runners import Remote, RemoteShell, Result
-from .group import Group, SerialGroup, ThreadingGroup, GroupResult
+from .group import (
+    Group,
+    SerialGroup,
+    ThreadingGroup,
+    GroupResult,
+    GroupManifest,
+    HostResult,
+)
 from .tasks import task, Task
 from .executor import Executor
 
