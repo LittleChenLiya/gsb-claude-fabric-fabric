@@ -12,6 +12,7 @@ from paramiko.config import SSHConfig
 from paramiko.proxy import ProxyCommand
 
 from .config import Config
+from .cwd import RemoteCwdStacks
 from .exceptions import InvalidV1Env
 from .transfer import Transfer
 from .tunnels import Tunnel, TunnelManager
@@ -140,6 +141,7 @@ class Connection(Context):
     transport = None
     _sftp = None
     _agent_handler = None
+    _remote_cwds = None
 
     @classmethod
     def from_v1(cls, env, **kwargs):
@@ -391,6 +393,10 @@ class Connection(Context):
         elif not isinstance(config, Config):
             config = config.clone(into=Config)
         self._set(_config=config)
+        # Per-thread remote cwd scope stacks. Kept separate from Invoke's
+        # shared command_cwds list so concurrent threads on one Connection do
+        # not leak directory state into each other's commands.
+        self._set(_remote_cwds=RemoteCwdStacks())
         # TODO: when/how to run load_files, merge, load_shell_env, etc?
         # TODO: i.e. what is the lib use case here (and honestly in invoke too)
 
@@ -760,28 +766,45 @@ class Connection(Context):
         This method wraps an SSH-capable implementation of
         `invoke.runners.Runner.run`; see its documentation for details.
 
+        Any active remote cwd scope (see `cd`) is snapshotted at call time and
+        prepended as an explicit, shell-quoted ``cd ... &&`` chain. The
+        snapshot is per invocation, so concurrent threads sharing this
+        connection cannot influence each other's working directory.
+
         .. warning::
             There are a few spots where Fabric departs from Invoke's default
             settings/behaviors; they are documented under
             `.Config.global_defaults`.
 
         .. versionadded:: 2.0
+        .. versionchanged:: 3.1
+            Remote ``cd`` scopes are now explicit, per-thread and snapshotted
+            per command invocation, with all directory values shell-quoted.
         """
-        return self._run(self._remote_runner(), command, **kwargs)
+        return self._run(
+            self._remote_runner(), self._remote_cwds.wrap(command), **kwargs
+        )
 
     @opens
     def sudo(self, command, **kwargs):
         """
         Execute a shell command, via ``sudo``, on the remote end.
 
-        This method is identical to `invoke.context.Context.sudo` in every way,
-        except in that -- like `run` -- it honors per-host/per-connection
+        This method is identical to `invoke.context.Context.sudo` in every
+        way, except in that -- like `run` -- it honors per-host/per-connection
         configuration overrides in addition to the generic/global ones. Thus,
         for example, per-host sudo passwords may be configured.
 
+        Like `run`, the command is bound to a snapshot of the calling thread's
+        active `cd` scope.
+
         .. versionadded:: 2.0
+        .. versionchanged:: 3.1
+            Remote ``cd`` scopes are honored and shell-quoted here as well.
         """
-        return self._sudo(self._remote_runner(), command, **kwargs)
+        return self._sudo(
+            self._remote_runner(), self._remote_cwds.wrap(command), **kwargs
+        )
 
     @opens
     def shell(self, **kwargs):
@@ -870,11 +893,80 @@ class Connection(Context):
         This method is effectively a wrapper of `invoke.run`; see its docs for
         details and call signature.
 
+        .. note::
+            This is *not* affected by the remote-only `cd` context manager;
+            use `invoke.context.Context.prefix` or invoke-level directory
+            handling for local commands.
+
         .. versionadded:: 2.0
         """
         # Superclass run() uses runners.local, so we can literally just call it
         # straight.
         return super().run(*args, **kwargs)
+
+    @contextmanager
+    def cd(self, path):
+        """
+        Keep explicit remote working-directory state for nested `run`/`sudo`.
+
+        Every `run`/`sudo` call inside the block is prefixed with an explicit,
+        shell-quoted ``cd <path> && ...`` chain so commands behave as if they
+        shared a persistent shell, even though each SSH command runs in its own
+        session::
+
+            with cxn.cd('/srv/my app'):
+                cxn.run('ls')  # -> cd '/srv/my app' && ls
+
+        Scopes may be nested; relative paths extend the outer directory and an
+        absolute (or ``~``-relative) inner path resets it::
+
+            with cxn.cd('/srv'):
+                with cxn.cd('my app'):
+                    cxn.run('ls')  # -> cd /srv && cd 'my app' && ls
+
+        Key properties:
+
+        - **Explicit, not guessed.** Directory state comes solely from entered
+          scopes; no ``pwd`` or other probing command is ever executed.
+        - **Bound per invocation.** The active chain is snapshotted when each
+          command starts; later scope entry/exit cannot change it.
+        - **Thread isolated.** Each thread gets its own scope stack, so worker
+          threads sharing one `.Connection` never mix working directories.
+        - **Always restored.** Exiting the block (even via an exception) pops
+          the scope, returning subsequent commands to the outer directory.
+        - **Safely quoted.** Paths are passed through `shlex.quote`, so spaces
+          and quote characters (e.g. ``it's "fun"``) stay part of the path and
+          cannot become extra commands or flags.
+
+        :param path:
+            The directory to enter. Cast to ``str`` on entry, so ``pathlib``
+            and similar objects are accepted.
+
+        .. note::
+            This scope applies to *remote* commands (`run`, `sudo`) only; it
+            does not affect `local`.
+
+        .. versionadded:: 3.1
+        """
+        with self._remote_cwds.scope(path):
+            yield
+
+    @property
+    def remote_cwd(self):
+        """
+        The calling thread's current effective remote directory, or ``""``.
+
+        Returns the joined (POSIX-style) path implied by the active nested
+        `cd` scopes for *this thread*; the empty string when no scope is
+        active. This value is informational -- commands always bind their own
+        snapshot at execution time.
+
+        .. versionadded:: 3.1
+        """
+        scope = self._remote_cwds.current()
+        if scope is None:
+            return ""
+        return "/".join(scope.segments())
 
     @opens
     def sftp(self):
