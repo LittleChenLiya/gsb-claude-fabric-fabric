@@ -1,4 +1,6 @@
+import posixpath
 import socket
+import threading
 from contextlib import contextmanager
 from io import StringIO
 from threading import Event
@@ -381,6 +383,11 @@ class Connection(Context):
         # __init__ up in a manner that is more cleanly overrideable.
         super().__init__(config=config, remainder=remainder)
 
+        # Thread-local storage for cwd scopes. Each Connection gets its own
+        # threading.local(), so concurrent threads using the same Connection
+        # are isolated from each other.
+        self._set(_cwd_local=threading.local())
+
         #: The .Config object referenced when handling default values (for e.g.
         #: user or port, when not explicitly given) or deciding how to behave.
         if config is None:
@@ -474,6 +481,86 @@ class Connection(Context):
         #: Whether to construct remote command lines with env vars prefixed
         #: inline.
         self.inline_ssh_env = inline_ssh_env
+
+    def _cwd_stack(self):
+        """
+        Return the per-thread stack of cwd paths for this Connection.
+
+        The stack is stored in a `threading.local` instance, so each thread
+        sees its own stack. This provides isolation for concurrent threads
+        sharing a single Connection.
+        """
+        local = self._cwd_local
+        stack = getattr(local, "stack", None)
+        if stack is None:
+            stack = []
+            local.stack = stack
+        return stack
+
+    @contextmanager
+    def cd(self, path):
+        """
+        Context manager that sets the remote working directory for commands
+        executed within its scope.
+
+        Commands run via `run`/`sudo` inside the scope will have their command
+        string prefixed with ``cd <path> && ``, using proper shell quoting to
+        prevent injection.
+
+        Scopes may be nested; exiting a scope (even via an exception) restores
+        the previous working directory. The cwd state is stored per-thread, so
+        concurrent threads sharing a Connection are isolated from each other.
+
+        :param path:
+            The remote working directory to ``cd`` into. It is quoted with
+            `shlex.quote` before being inserted into the command string, so
+            paths containing spaces or shell metacharacters are safe.
+
+        **Two-scope example** (nested directories with spaces)::
+
+            with Connection('host') as c:
+                with c.cd('/var/www'):
+                    c.run('ls')  # cd /var/www && ls
+                    with c.cd('my site'):
+                        c.run('ls')  # cd '/var/www/my site' && ls
+                    # Back to /var/www here
+                    c.run('pwd')  # cd /var/www && pwd
+
+        .. versionadded:: 3.3
+        """
+        path = str(path)
+        stack = self._cwd_stack()
+        # Store the full path: if the new path is relative, join it with the
+        # current cwd (POSIX-style); if absolute (or ~-relative), use it as-is.
+        if stack and not path.startswith(("/", "~")):
+            full_path = posixpath.join(stack[-1], path)
+        else:
+            full_path = path
+        stack.append(full_path)
+        try:
+            yield self
+        finally:
+            stack.pop()
+
+    @property
+    def cwd(self):
+        """
+        Return the current remote working directory, or ``""`` if no cwd scope
+        is active.
+
+        The returned value reflects the cwd at the time of the call and is not
+        affected by later scope changes.
+        """
+        stack = self._cwd_stack()
+        return stack[-1] if stack else ""
+
+    def _prefix_commands(self, command):
+        # Only handle command_prefixes; cwd is applied in Remote.start() with
+        # proper shell quoting. This avoids reading from the shared mutable
+        # command_cwds stack and ensures the cwd is snapshotted at command
+        # execution time.
+        prefixes = list(self.command_prefixes)
+        return " && ".join(prefixes + [command]) if prefixes else command
 
     def resolve_connect_kwargs(self, connect_kwargs):
         # TODO: is it better to pre-empt conflicts w/ manually-handled

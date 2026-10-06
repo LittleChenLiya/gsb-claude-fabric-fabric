@@ -1,7 +1,26 @@
 import signal
 import threading
+from shlex import quote as shlex_quote
 
 from invoke import Runner, pty_size, Result as InvokeResult
+
+
+def _quote_remote_path(path):
+    """
+    Quote a remote path for safe inclusion in a shell command.
+
+    Uses `shlex.quote` for proper shell escaping, but allows a leading ``~``
+    to remain unquoted so the shell can expand it (e.g. ``~/foo``). The rest
+    of the path is still quoted to prevent injection.
+    """
+    if path.startswith("~"):
+        rest = path[1:]
+        if rest.startswith("/"):
+            rest = rest[1:]
+        if rest:
+            return "~/" + shlex_quote(rest)
+        return "~"
+    return shlex_quote(path)
 
 
 def cares_about_SIGWINCH():
@@ -55,6 +74,14 @@ class Remote(Runner):
             # sending the sshd a window-change message to update
             if cares_about_SIGWINCH():
                 signal.signal(signal.SIGWINCH, self.handle_window_change)
+        # Bind the command to the current cwd snapshot. This reads the cwd from
+        # the context's thread-local stack at build time and bakes it into the
+        # command string, so the command is not affected by later changes to
+        # the stack (e.g. scope exit or another thread). The path is quoted
+        # with shlex.quote to prevent shell injection.
+        cwd = getattr(self.context, "cwd", "")
+        if cwd:
+            command = "cd {} && {}".format(_quote_remote_path(cwd), command)
         if env:
             # TODO: honor SendEnv from ssh_config (but if we do, _should_ we
             # honor it even when prefixing? That would depart from OpenSSH
