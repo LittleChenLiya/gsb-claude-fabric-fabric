@@ -13,6 +13,13 @@ Changelog
     names in this paragraph to visit their changelogs and see what you might get
     if you upgrade your dependencies.
 
+- :feature:`-` The ``host`` argument of `.Connection` (and other places host
+  shorthand strings are accepted, such as SSH-config ProxyJump hops) now
+  supports square-bracketed IPv6 addresses with an explicit port, per RFC 3986:
+  ``[::1]:222`` and ``user@[2001:db8::1]:222``. Bare IPv6 addresses remain
+  treated as portless, and a bracketed address missing its closing bracket now
+  raises `ValueError` at construction time instead of risking its colons being
+  mistaken for a port.
 - :release:`3.2.3 <2026-04-05>`
 - :support:`- backported` Tweak packaging metadata to reflect that Invoke 3.0
   has a backwards incompatible API change that we can't use yet.

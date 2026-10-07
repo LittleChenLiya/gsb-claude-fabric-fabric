@@ -105,6 +105,39 @@ class Connection_:
                     assert c2.host == addr
                     assert c2.port == 123
 
+            def ipv6_bracket_port_shorthand(self):
+                c = Connection("[2001:DB8::1]:123")
+                assert c.host == "2001:DB8::1"
+                assert c.port == 123
+
+            def ipv6_bracket_port_shorthand_may_include_user(self):
+                c = Connection("somebody@[2001:DB8::1]:123")
+                assert c.user == "somebody"
+                assert c.host == "2001:DB8::1"
+                assert c.port == 123
+
+            def ipv6_brackets_without_port_are_still_portless(self):
+                c = Connection("[2001:DB8::1]")
+                assert c.host == "2001:DB8::1"
+                assert c.port == 22
+                c2 = Connection("somebody@[::1]")
+                assert c2.user == "somebody"
+                assert c2.host == "::1"
+                assert c2.port == 22
+
+            def ipv6_missing_closing_bracket_is_rejected_before_connect(
+                self, client
+            ):
+                # No guessing: the colons must never be parsed as a port.
+                with pytest.raises(ValueError) as error:
+                    Connection("somebody@[2001:DB8::1:123")
+                err = str(error.value)
+                assert "bracket" in err
+                assert "2001:DB8::1:123" in err
+                # Construction failed, so no SSH client was ever asked to
+                # connect.
+                assert client.connect.call_count == 0
+
         class user:
             def defaults_to_local_user_with_no_config(self):
                 # Tautology-tastic!
@@ -736,6 +769,19 @@ class Connection_:
             client.connect.assert_called_once_with(
                 username="myuser", hostname="myhost", port=9001
             )
+
+        def passes_bracketed_ipv6_shorthand_to_connect(self, client):
+            Connection("somebody@[2001:db8::1]:9001").open()
+            client.connect.assert_called_once_with(
+                username="somebody", hostname="2001:db8::1", port=9001
+            )
+
+        def does_not_call_connect_for_ipv6_missing_closing_bracket(
+            self, client
+        ):
+            with pytest.raises(ValueError):
+                Connection("[2001:db8::1:9001")
+            assert client.connect.call_count == 0
 
         # NOTE: does more involved stuff so can't use "client" fixture
         @patch("fabric.connection.SSHClient")
