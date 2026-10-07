@@ -184,7 +184,7 @@ class Transfer:
             connection=self.connection,
         )
 
-    def put(self, local, remote=None, preserve_mode=True):
+    def put(self, local, remote=None, preserve_mode=True, reject_dirs=True):
         """
         Upload a file from the local filesystem to the current connection.
 
@@ -226,14 +226,41 @@ class Transfer:
             Whether to ``chmod`` the remote file so it matches the local file's
             mode (default: ``True``).
 
+        :param bool reject_dirs:
+            Whether to perform a local preflight check rejecting ``local``
+            paths which point at directories (default: ``True``).
+
+            When enabled, and ``local`` is a path (not a file-like object)
+            whose final target is a directory - i.e. symbolic links are
+            followed and judged by what they resolve to - a `ValueError` is
+            raised **before** any remote connection is opened or any other
+            remote path resolution occurs.
+
+            File-like objects are never subject to this check, and nonexistent
+            paths are left to the usual file-handling errors. Disable this
+            flag to restore the previous behavior of deferring directory
+            detection to the underlying SFTP layer.
+
         :returns: A `.Result` object.
 
         .. versionadded:: 2.0
+        .. versionchanged:: 4.0
+            Added the ``reject_dirs`` local preflight check.
         """
         if not local:
             raise ValueError("Local path must not be empty!")
 
         is_file_like = hasattr(local, "write") and callable(local.write)
+
+        # Local preflight: refuse directory sources up front, before any
+        # remote connection is opened or remote paths are resolved. File-like
+        # objects are exempt, and os.path.isdir follows symlinks, so links are
+        # judged by their final target.
+        if reject_dirs and not is_file_like and os.path.isdir(local):
+            raise ValueError(
+                "Refusing to upload local directory {!r}: put() only "
+                "supports regular files or file-like objects".format(local)
+            )
 
         # Massage remote path
         orig_remote = remote

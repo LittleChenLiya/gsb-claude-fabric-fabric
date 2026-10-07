@@ -295,7 +295,7 @@ class Session:
         # Not super clear to me why the 'wraps' functionality in mock isn't
         # working for this :( reinstate a bunch of os(.path) so it still works
         mock_os.sep = os.sep
-        for name in ("basename", "split", "join", "normpath"):
+        for name in ("basename", "split", "join", "normpath", "isdir"):
             getattr(mock_os.path, name).side_effect = getattr(os.path, name)
 
     @deprecated_no_docstring(
@@ -532,7 +532,7 @@ class MockSFTP:
         # Not super clear to me why the 'wraps' functionality in mock isn't
         # working for this :( reinstate a bunch of os(.path) so it still works
         mock_os.sep = os.sep
-        for name in ("basename", "split", "join", "normpath"):
+        for name in ("basename", "split", "join", "normpath", "isdir"):
             getattr(mock_os.path, name).side_effect = getattr(os.path, name)
         # Return the sftp and OS mocks for use by decorator use case.
         return sftp, mock_os

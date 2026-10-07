@@ -1,8 +1,11 @@
-from io import StringIO
+import os
+import subprocess
+
+from io import BytesIO, StringIO
 
 from unittest.mock import Mock, call, patch
 from pytest_relaxed import raises
-from pytest import skip  # noqa
+from pytest import skip, raises as pytest_raises  # noqa
 from paramiko import SFTPAttributes
 
 from fabric import Connection
@@ -286,6 +289,105 @@ class Transfer_:
                 result, fd = self._put_from_stringio(sftp_objs)
                 assert result.remote == "/remote/file"
                 assert result.local is fd
+
+        class local_directory_precheck:
+            "local directory rejection policy (reject_dirs)"
+
+            def _symlink(self, target, link, **kwargs):
+                try:
+                    os.symlink(str(target), str(link), **kwargs)
+                except (OSError, NotImplementedError) as e:
+                    skip("cannot create symlinks here: {}".format(e))
+
+            def _dir_link(self, target, link):
+                # Prefer a real symlink; on Windows, where unprivileged
+                # symlink creation is often blocked, fall back to a directory
+                # junction (also a reparse point os.path.isdir follows).
+                try:
+                    os.symlink(
+                        str(target), str(link), target_is_directory=True
+                    )
+                except (OSError, NotImplementedError) as e:
+                    if os.name != "nt":
+                        skip("cannot create symlinks here: {}".format(e))
+                    try:
+                        subprocess.run(
+                            [
+                                "cmd",
+                                "/c",
+                                "mklink",
+                                "/J",
+                                str(link),
+                                str(target),
+                            ],
+                            check=True,
+                            capture_output=True,
+                        )
+                    except (OSError, subprocess.CalledProcessError) as e2:
+                        skip(
+                            "cannot create dir symlinks or junctions here: "
+                            "{} / {}".format(e, e2)
+                        )
+
+            def rejects_real_directory_before_any_remote_call(self, tmp_path):
+                xfer = Transfer(Connection("host"))
+                with patch.object(Connection, "sftp") as sftp:
+                    with pytest_raises(ValueError, match="directory"):
+                        xfer.put(str(tmp_path))
+                # Preflight fired before the remote connection was opened
+                assert not sftp.called
+
+            def rejects_symlink_to_directory_before_any_remote_call(
+                self, tmp_path
+            ):
+                target = tmp_path / "target"
+                target.mkdir()
+                link = tmp_path / "link"
+                self._dir_link(target, link)
+                xfer = Transfer(Connection("host"))
+                with patch.object(Connection, "sftp") as sftp:
+                    with pytest_raises(ValueError, match="directory"):
+                        xfer.put(str(link))
+                assert not sftp.called
+
+            def allows_regular_files_unchanged(self, tmp_path, sftp_objs):
+                transfer, client = sftp_objs
+                path = tmp_path / "file.txt"
+                path.write_text("hi")
+                transfer.put(str(path))
+                client.put.assert_called_once_with(
+                    localpath="/local/{}".format(os.path.normpath(str(path))),
+                    remotepath="/remote/file.txt",
+                )
+
+            def allows_symlink_to_regular_file(self, tmp_path, sftp_objs):
+                # Symlinks are judged by their final target; a link to a
+                # regular file is not a directory and uploads as before.
+                transfer, client = sftp_objs
+                target = tmp_path / "real.txt"
+                target.write_text("hi")
+                link = tmp_path / "link.txt"
+                self._symlink(target, link)
+                transfer.put(str(link))
+                client.put.assert_called_once_with(
+                    localpath="/local/{}".format(os.path.normpath(str(link))),
+                    remotepath="/remote/link.txt",
+                )
+
+            def allows_file_like_objects(self, sftp_objs):
+                transfer, client = sftp_objs
+                fd = BytesIO(b"sup\n")
+                transfer.put(fd, remote="file")
+                client.putfo.assert_called_once_with(
+                    remotepath="/remote/file", fl=fd
+                )
+
+            def rejection_policy_can_be_disabled(self, tmp_path, sftp_objs):
+                transfer, client = sftp_objs
+                # Opting out defers directory detection to the SFTP layer,
+                # exactly as before the preflight existed.
+                transfer.put(str(tmp_path), reject_dirs=False)
+                assert client.put.called
 
         class mode_concerns:
             def preserves_local_mode_by_default(self, sftp):
