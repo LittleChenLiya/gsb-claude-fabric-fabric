@@ -28,13 +28,30 @@ def derive_shorthand(host_string):
     hostport = user_hostport.pop()
     user = user_hostport[0] if user_hostport and user_hostport[0] else None
 
-    # IPv6: can't reliably tell where addr ends and port begins, so don't
-    # try (and don't bother adding special syntax either, user should avoid
-    # this situation by using port=).
-    if hostport.count(":") > 1:
+    # Bracketed IPv6 literal, optionally with a port: [addr] or [addr]:port.
+    # The brackets are the only unambiguous place a port can be attached to
+    # an IPv6 address, so they are required for port shorthand to work.
+    if hostport.startswith("["):
+        end = hostport.find("]")
+        if end == -1:
+            err = "Supplied host {!r} looks like a bracketed IPv6 address but is missing its closing ']'; refusing to guess where the address ends!"  # noqa
+            raise ValueError(err.format(host_string))
+        host = hostport[1:end]
+        tail = hostport[end + 1:]
+        if tail:
+            if not tail.startswith(":"):
+                err = "Supplied host {!r} has unexpected text {!r} after the bracketed IPv6 address; expected an optional ':port' suffix!"  # noqa
+                raise ValueError(err.format(host_string, tail))
+            port = tail[1:] or None
+        else:
+            port = None
+    # Bare IPv6 (without brackets): can't reliably tell where addr ends and
+    # port begins, so don't try (user should use the [addr]:port shorthand or
+    # the port= kwarg).
+    elif hostport.count(":") > 1:
         host = hostport
         port = None
-    # IPv4: can split on ':' reliably.
+    # IPv4 / regular hostname: can split on ':' reliably.
     else:
         host_port = hostport.rsplit(":", 1)
         host = host_port.pop(0) or None
@@ -229,11 +246,15 @@ class Connection(Context):
             of the form ``user@host``, ``host:port``, or ``user@host:port``.
 
             .. note::
-                Due to ambiguity, IPv6 host addresses are incompatible with the
-                ``host:port`` shorthand (though ``user@host`` will still work
-                OK). In other words, the presence of >1 ``:`` character will
-                prevent any attempt to derive a shorthand port number; use the
-                explicit ``port`` parameter instead.
+                Due to ambiguity, bare IPv6 host addresses (containing >1
+                ``:`` character) are treated as having no shorthand port; the
+                address' own colons are never interpreted as a port. To
+                specify a port alongside an IPv6 literal, wrap the address in
+                square brackets, as in ``user@[2001:db8::1]:2200`` (an
+                unbracketed IPv6 address such as ``2001:db8::1`` remains a
+                valid, port-less host value). A bracketed address missing its
+                closing ``]`` is rejected with `ValueError` before any
+                connection is attempted.
 
             .. note::
                 If ``host`` matches a ``Host`` clause in loaded SSH config
@@ -362,7 +383,9 @@ class Connection(Context):
 
         :raises ValueError:
             if user or port values are given via both ``host`` shorthand *and*
-            their own arguments. (We `refuse the temptation to guess`_).
+            their own arguments, or if a bracketed IPv6 shorthand address is
+            malformed (eg missing its closing ``]``). (We `refuse the
+            temptation to guess`_).
 
         .. _refuse the temptation to guess:
             http://zen-of-python.info/

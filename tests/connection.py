@@ -105,6 +105,40 @@ class Connection_:
                     assert c2.host == addr
                     assert c2.port == 123
 
+            def bare_ipv6_address_has_no_shorthand_port(self):
+                # Bare (unbracketed) IPv6 must never have its own colons
+                # mistaken for a port separator.
+                for addr in ("2001:DB8::1", "::1"):
+                    c = Connection(addr)
+                    assert c.host == addr
+                    assert c.port == 22
+                    c2 = Connection("somebody@{}".format(addr))
+                    assert c2.user == "somebody"
+                    assert c2.host == addr
+                    assert c2.port == 22
+
+            def bracketed_ipv6_may_carry_port_shorthand(self):
+                # [addr]:port, user@[addr]:port and bare [addr] forms
+                addr = "2001:db8::1"
+                c = Connection("[{}]:2200".format(addr))
+                assert c.host == addr
+                assert c.port == 2200
+                c = Connection("somebody@[{}]:2200".format(addr))
+                assert c.user == "somebody"
+                assert c.host == addr
+                assert c.port == 2200
+                c = Connection("[{}]".format(addr))
+                assert c.host == addr
+                assert c.port == 22
+
+            @raises(ValueError)
+            def bracketed_ipv6_missing_right_bracket_is_rejected(self):
+                Connection("somebody@[2001:db8::1:2200")
+
+            @raises(ValueError)
+            def bracketed_ipv6_with_garbage_after_bracket_is_rejected(self):
+                Connection("[2001:db8::1]nope")
+
         class user:
             def defaults_to_local_user_with_no_config(self):
                 # Tautology-tastic!
@@ -736,6 +770,35 @@ class Connection_:
             client.connect.assert_called_once_with(
                 username="myuser", hostname="myhost", port=9001
             )
+
+        def parses_short_addresses_for_connect_params(self, client):
+            # user@[bracketed-ipv6]:port, bare IPv6, plain host, plus the
+            # illegal missing-right-bracket value which must yield zero SSH.
+            Connection("somebody@[2001:db8::1]:2200").open()
+            Connection("2001:db8::1").open()
+            Connection("myhost").open()
+            assert client.connect.call_args_list == [
+                call(
+                    username="somebody",
+                    hostname="2001:db8::1",
+                    port=2200,
+                ),
+                call(
+                    username=get_local_user(),
+                    hostname="2001:db8::1",
+                    port=22,
+                ),
+                call(
+                    username=get_local_user(),
+                    hostname="myhost",
+                    port=22,
+                ),
+            ]
+            before = client.connect.call_count
+            with pytest.raises(ValueError):
+                Connection("somebody@[2001:db8::1:2200")
+            # Rejected at construction time, before any connection attempt.
+            assert client.connect.call_count == before
 
         # NOTE: does more involved stuff so can't use "client" fixture
         @patch("fabric.connection.SSHClient")
