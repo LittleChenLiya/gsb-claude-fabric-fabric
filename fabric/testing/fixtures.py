@@ -121,7 +121,9 @@ def sftp():
     # Regular ol transfer to save some time
     transfer = Transfer(Connection("host"))
     yield transfer, client, mock_os
-    # TODO: old mock_sftp() lacked any 'stop'...why? feels bad man
+    # NOTE: without this, the deprecated MockSFTP's module-level patches
+    # (notably of fabric.transfer.os) leak into any tests running afterwards.
+    mock.stop()
 
 
 @fixture

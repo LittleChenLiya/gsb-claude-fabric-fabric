@@ -184,7 +184,9 @@ class Transfer:
             connection=self.connection,
         )
 
-    def put(self, local, remote=None, preserve_mode=True):
+    def put(
+        self, local, remote=None, preserve_mode=True, reject_dirs=True
+    ):
         """
         Upload a file from the local filesystem to the current connection.
 
@@ -226,14 +228,44 @@ class Transfer:
             Whether to ``chmod`` the remote file so it matches the local file's
             mode (default: ``True``).
 
+        :param bool reject_dirs:
+            Whether to perform a **local preflight check** rejecting directory
+            sources *before* any remote connection or SFTP call is made
+            (default: ``True``).
+
+            When enabled and ``local`` is a local path pointing at a
+            directory, a clear `ValueError` is raised instead of attempting
+            (and failing) on the remote end. Symlinks are judged by their
+            **final target** (via `os.path.isdir`, which follows links), so a
+            link to a directory is rejected just like the directory itself.
+
+            File-like objects are not local paths and always bypass this check.
+            Set to ``False`` to restore the legacy behavior of deferring
+            entirely to the SFTP server (which typically raises its own error).
+
         :returns: A `.Result` object.
 
         .. versionadded:: 2.0
+        .. versionchanged:: 4.0
+            Added the ``reject_dirs`` local preflight check, enabled by
+            default.
         """
         if not local:
             raise ValueError("Local path must not be empty!")
 
         is_file_like = hasattr(local, "write") and callable(local.write)
+
+        # Local preflight: when enabled, refuse directory sources up front,
+        # before any remote connection/SFTP work is attempted. os.path.isdir
+        # follows symlinks, so a link is judged by its final target; this also
+        # transparently supports pathlib.Path inputs. File-like objects have no
+        # local filesystem meaning and skip the check entirely.
+        if reject_dirs and not is_file_like and os.path.isdir(local):
+            raise ValueError(
+                "Local upload source {!r} is a directory, but put() only "
+                "supports regular files (or file-like objects); directory "
+                "uploads are not supported.".format(local)
+            )
 
         # Massage remote path
         orig_remote = remote

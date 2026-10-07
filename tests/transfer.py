@@ -1,8 +1,11 @@
-from io import StringIO
+import os
+
+from io import BytesIO, StringIO
 
 from unittest.mock import Mock, call, patch
 from pytest_relaxed import raises
 from pytest import skip  # noqa
+import pytest
 from paramiko import SFTPAttributes
 
 from fabric import Connection
@@ -299,3 +302,215 @@ class Transfer_:
                 transfer, client = sftp_objs
                 transfer.put("file", preserve_mode=False)
                 assert not client.chmod.called
+
+        class local_directory_preflight:
+            "local directory-source rejection before opening the connection"
+
+            def raises_ValueError_for_local_directory(self, sftp_objs):
+                xfer, sftp = sftp_objs
+                with patch(
+                    "fabric.transfer.os.path.isdir", return_value=True
+                ):
+                    with pytest.raises(ValueError, match="directory"):
+                        xfer.put("somedir", remote="remote-path")
+                # No remote SFTP operations of any kind were attempted
+                assert sftp.method_calls == []
+                sftp.put.assert_not_called()
+                sftp.putfo.assert_not_called()
+                sftp.stat.assert_not_called()
+                sftp.getcwd.assert_not_called()
+                sftp.normalize.assert_not_called()
+                # And the underlying SSH client never opened an SFTP channel
+                xfer.connection.client.open_sftp.assert_not_called()
+
+            def error_message_identifies_offending_source(self, sftp_objs):
+                xfer, sftp = sftp_objs
+                with patch(
+                    "fabric.transfer.os.path.isdir", return_value=True
+                ):
+                    with pytest.raises(ValueError) as exc:
+                        xfer.put("some/dir", remote="remote-path")
+                assert "some/dir" in str(exc.value)
+
+            def symlink_to_directory_is_rejected_like_directory(
+                self, sftp_objs
+            ):
+                xfer, sftp = sftp_objs
+                # os.path.isdir is what follows symlinks to their final target
+                with patch(
+                    "fabric.transfer.os.path.isdir",
+                    side_effect=lambda path: path == "dir-link",
+                ) as isdir:
+                    with pytest.raises(ValueError):
+                        xfer.put("dir-link", remote="remote-path")
+                isdir.assert_called_once_with("dir-link")
+                sftp.put.assert_not_called()
+                sftp.putfo.assert_not_called()
+
+            def symlink_to_regular_file_is_not_rejected(self, sftp_objs):
+                xfer, sftp = sftp_objs
+                with patch(
+                    "fabric.transfer.os.path.isdir",
+                    side_effect=lambda path: False,
+                ):
+                    xfer.put("file-link", remote="remote-path")
+                sftp.put.assert_called_with(
+                    localpath="/local/file-link",
+                    remotepath="/remote/remote-path",
+                )
+
+            def regular_file_source_is_unchanged(self, sftp_objs):
+                xfer, sftp = sftp_objs
+                # Mocked harness's isdir delegates to the real os.path.isdir,
+                # and a nonexistent "file" is therefore not a directory.
+                xfer.put("file")
+                sftp.put.assert_called_with(
+                    localpath="/local/file", remotepath="/remote/file"
+                )
+
+            def file_like_sources_always_bypass_preflight(self, sftp_objs):
+                xfer, sftp = sftp_objs
+                fd = StringIO("data\n")
+                with patch("fabric.transfer.os.path.isdir") as isdir:
+                    xfer.put(fd, remote="file")
+                isdir.assert_not_called()
+                sftp.putfo.assert_called_with(
+                    fl=fd, remotepath="/remote/file"
+                )
+
+            def can_be_disabled_to_restore_legacy_behavior(self, sftp_objs):
+                xfer, sftp = sftp_objs
+                with patch(
+                    "fabric.transfer.os.path.isdir", return_value=True
+                ):
+                    xfer.put("somedir", remote="file", reject_dirs=False)
+                # Remote target resolution & local abspath massage are intact
+                sftp.put.assert_called_with(
+                    localpath="/local/somedir", remotepath="/remote/file"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Real local-fixture acceptance tests (temporary files, directories, symlinks
+# and BytesIO) using an in-memory SFTP stand-in. No SSH/SFTP network activity
+# can occur: the Connection's memoized _sftp is a Mock, and SSHClient itself
+# is patched.
+# ---------------------------------------------------------------------------
+def _preflight_transfer():
+    with patch("fabric.connection.SSHClient") as SSHClient:
+        cxn = Connection("host")
+        sftp = Mock()
+        # Remote "cwd" resolution: no getcwd; normalize gives an anchor
+        sftp.getcwd.return_value = None
+        sftp.normalize.return_value = "/remote/home"
+        # Any remote stat failure means "not a remote directory", matching
+        # Transfer.is_remote_dir's existing behavior.
+        sftp.stat.side_effect = IOError
+        cxn._sftp = sftp  # short-circuit Connection.sftp() memoization
+        return Transfer(cxn), sftp, SSHClient
+
+
+def _link_or_skip(source, link):
+    """
+    Create a filesystem link at ``link`` pointing at ``source``.
+
+    Uses a real symlink when permitted (POSIX, or privileged/Developer-Mode
+    Windows). On Windows without that privilege, falls back to a directory
+    junction (for directory targets) or a hard link (for file targets); both
+    are still resolved by their final target by ``os.path.isdir``/``isfile``.
+    """
+    source = str(source)
+    link = str(link)
+    try:
+        os.symlink(source, link)
+        return
+    except (OSError, NotImplementedError, AttributeError):
+        pass
+    if os.name != "nt":
+        pytest.skip("symlink creation is not permitted on this platform")
+    import subprocess
+
+    kind = "/J" if os.path.isdir(source) else "/H"
+    try:
+        subprocess.run(
+            ["cmd", "/c", "mklink", kind, link, source],
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("filesystem link creation is not permitted here")
+
+
+def test_put_accepts_temporary_file_and_preserves_target_resolution(tmp_path):
+    src = tmp_path / "plain.txt"
+    src.write_text("payload\n")
+    xfer, sftp, _ = _preflight_transfer()
+    result = xfer.put(str(src), remote="uploaded.txt")
+    sftp.put.assert_called_once_with(
+        localpath=os.path.abspath(str(src)),
+        remotepath="/remote/home/uploaded.txt",
+    )
+    assert result.local == os.path.abspath(str(src))
+    assert result.remote == "/remote/home/uploaded.txt"
+    assert result.orig_local == str(src)
+
+
+def test_put_rejects_real_directory_without_any_remote_call(tmp_path):
+    target_dir = tmp_path / "a-directory"
+    target_dir.mkdir()
+    src = str(target_dir)
+    xfer, sftp, SSHClient = _preflight_transfer()
+    with pytest.raises(ValueError) as exc:
+        xfer.put(src, remote="remote-target")
+    message = str(exc.value)
+    assert "directory" in message.lower()
+    # {!r} doubles Windows backslashes, so match against repr(src)
+    assert repr(src) in message
+    # Not a single remote SFTP call...
+    assert sftp.method_calls == []
+    # ...and the SSH client neither connected nor opened an SFTP channel.
+    SSHClient.return_value.connect.assert_not_called()
+    SSHClient.return_value.open_sftp.assert_not_called()
+
+
+def test_put_rejects_directory_symlink_by_final_target(tmp_path):
+    target_dir = tmp_path / "actual-directory"
+    target_dir.mkdir()
+    link = tmp_path / "dir-link"
+    _link_or_skip(str(target_dir), str(link))
+    assert os.path.isdir(str(link))  # symlink judged via its final target
+    xfer, sftp, SSHClient = _preflight_transfer()
+    with pytest.raises(ValueError) as exc:
+        xfer.put(str(link), remote="remote-target")
+    assert repr(str(link)) in str(exc.value)
+    assert sftp.method_calls == []
+    SSHClient.return_value.open_sftp.assert_not_called()
+
+
+def test_put_accepts_symlink_pointing_at_regular_file(tmp_path):
+    src = tmp_path / "actual.txt"
+    src.write_text("via-link\n")
+    link = tmp_path / "file-link"
+    _link_or_skip(str(src), str(link))
+    assert not os.path.isdir(str(link))
+    xfer, sftp, _ = _preflight_transfer()
+    result = xfer.put(str(link), remote="uploaded.txt")
+    sftp.put.assert_called_once_with(
+        localpath=os.path.abspath(str(link)),
+        remotepath="/remote/home/uploaded.txt",
+    )
+    assert result.local == os.path.abspath(str(link))
+
+
+def test_put_accepts_BytesIO_and_rewinds_it(tmp_path):
+    fd = BytesIO(b"\x00\x01binary-data")
+    xfer, sftp, _ = _preflight_transfer()
+    result = xfer.put(fd, remote="blob.bin")
+    sftp.putfo.assert_called_once_with(
+        fl=fd, remotepath="/remote/home/blob.bin"
+    )
+    assert sftp.put.called is False
+    # File position is restored after the upload
+    assert fd.tell() == 0
+    assert result.local is fd
+    assert result.remote == "/remote/home/blob.bin"
